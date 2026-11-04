@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --test tests/worker.test.mjs tests/probe-status.test.mjs tests/probe-address.test.mjs",
+    "test:integration": "node --test tests/probe.integration.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",

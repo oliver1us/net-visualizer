@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Activity,
   MousePointerClick,
@@ -49,18 +49,15 @@ import {
 import { Separator } from '@/components/ui/separator';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
 import { cn } from '@/lib/utils';
+import {
+  describeProbe,
+  type ProbeResult,
+  type ProbeStatus,
+  type Protocol,
+} from '@/lib/probe-status';
 
-type Protocol = 'TCP' | 'ICMP' | 'UDP';
-type Status = 'healthy' | 'degraded' | 'down';
+type Status = ProbeStatus;
 type Filter = 'all' | Protocol;
 
 type Host = {
@@ -73,20 +70,15 @@ type Host = {
   rtt: number | null;
   jitter: number;
   loss: number;
+  message: string;
+  checkedAt: string | null;
 };
 
 const protocols: Protocol[] = ['TCP', 'ICMP', 'UDP'];
 
-const intervalItems = [
-  { value: '1', label: 'Every 1 second' },
-  { value: '2', label: 'Every 2 seconds' },
-  { value: '5', label: 'Every 5 seconds' },
-  { value: '10', label: 'Every 10 seconds' },
-];
-
 const statusMeta = {
   healthy: {
-    label: 'Healthy',
+    label: 'Responding',
     badge: 'border-success/25 bg-success/10 text-success',
     dot: 'bg-success',
     text: 'text-success',
@@ -95,8 +87,8 @@ const statusMeta = {
     fill: 'fill-success',
     node: 'stroke-success/35',
   },
-  degraded: {
-    label: 'Degraded',
+  checking: {
+    label: 'Checking',
     badge: 'border-warning/25 bg-warning/10 text-warning',
     dot: 'bg-warning',
     text: 'text-warning',
@@ -106,7 +98,7 @@ const statusMeta = {
     node: 'stroke-warning/35',
   },
   down: {
-    label: 'Unreachable',
+    label: 'Not connected',
     badge: 'border-destructive/30 bg-destructive/10 text-destructive',
     dot: 'bg-destructive',
     text: 'text-destructive',
@@ -115,54 +107,39 @@ const statusMeta = {
     fill: 'fill-destructive',
     node: 'stroke-destructive/40',
   },
+  unknown: {
+    label: 'Inconclusive',
+    badge: 'border-muted-foreground/30 text-muted-foreground',
+    dot: 'bg-muted-foreground',
+    text: 'text-muted-foreground',
+    stroke: 'stroke-muted-foreground/45',
+    glow: 'stroke-muted-foreground/10',
+    fill: 'fill-muted-foreground',
+    node: 'stroke-muted-foreground/40',
+  },
+  pending: {
+    label: 'Pending',
+    badge: 'border-muted-foreground/30 text-muted-foreground',
+    dot: 'bg-muted-foreground',
+    text: 'text-muted-foreground',
+    stroke: 'stroke-muted-foreground/45',
+    glow: 'stroke-muted-foreground/10',
+    fill: 'fill-muted-foreground',
+    node: 'stroke-muted-foreground/40',
+  },
+  error: {
+    label: 'Cannot check',
+    badge: 'border-warning/25 bg-warning/10 text-warning',
+    dot: 'bg-warning',
+    text: 'text-warning',
+    stroke: 'stroke-warning/45',
+    glow: 'stroke-warning/10',
+    fill: 'fill-warning',
+    node: 'stroke-warning/35',
+  },
 } as const;
 
-const initialHosts: Host[] = [
-  {
-    id: 'edge-01',
-    host: 'edge-01',
-    protocol: 'TCP',
-    port: 443,
-    interval: 1,
-    status: 'healthy',
-    rtt: 12,
-    jitter: 1.1,
-    loss: 0,
-  },
-  {
-    id: 'db-primary',
-    host: 'db-primary.internal',
-    protocol: 'TCP',
-    port: 5432,
-    interval: 2,
-    status: 'healthy',
-    rtt: 8,
-    jitter: 0.6,
-    loss: 0,
-  },
-  {
-    id: 'api-eu',
-    host: 'api-eu',
-    protocol: 'ICMP',
-    port: null,
-    interval: 1,
-    status: 'down',
-    rtt: null,
-    jitter: 0,
-    loss: 100,
-  },
-  {
-    id: 'cache-02',
-    host: 'cache-02',
-    protocol: 'UDP',
-    port: 11211,
-    interval: 5,
-    status: 'degraded',
-    rtt: 24,
-    jitter: 6.4,
-    loss: 1.8,
-  },
-];
+const initialHosts: Host[] = [];
 
 const GRAPH_WIDTH = 800;
 const GRAPH_HEIGHT = 480;
@@ -194,7 +171,9 @@ function shortHost(host: string) {
 function targetLabel(host: Host) {
   return host.protocol === 'ICMP'
     ? 'ICMP echo'
-    : `${host.protocol} :${host.port}`;
+    : host.protocol === 'UDP'
+      ? `UDP DNS :${host.port}`
+      : `TCP :${host.port}`;
 }
 
 function formatRtt(rtt: number | null) {
@@ -203,7 +182,7 @@ function formatRtt(rtt: number | null) {
 
 export function NetworkDashboard() {
   const [hosts, setHosts] = useState<Host[]>(initialHosts);
-  const [selectedId, setSelectedId] = useState<string | null>('edge-01');
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
   const [tab, setTab] = useState('topology');
   const [lastProbeAt, setLastProbeAt] = useState<string | null>(null);
@@ -211,17 +190,27 @@ export function NetworkDashboard() {
   const [hostInput, setHostInput] = useState('');
   const [protocol, setProtocol] = useState<Protocol>('TCP');
   const [port, setPort] = useState('443');
-  const [interval, setInterval] = useState('1');
   const [hostError, setHostError] = useState<string | null>(null);
   const [portError, setPortError] = useState<string | null>(null);
   const [addedName, setAddedName] = useState<string | null>(null);
+  const [isProbing, setIsProbing] = useState(false);
   const hostInputRef = useRef<HTMLInputElement>(null);
+  const hostsRef = useRef(hosts);
+  const activeTargets = useRef(new Set<string>());
+  const removedTargets = useRef(new Set<string>());
+  const activeCount = useRef(0);
+  const waiting = useRef<(() => void)[]>([]);
+  const roundActive = useRef(false);
+
+  useEffect(() => {
+    hostsRef.current = hosts;
+  }, [hosts]);
 
   const visibleHosts =
     filter === 'all' ? hosts : hosts.filter((h) => h.protocol === filter);
 
   const selected = hosts.find((h) => h.id === selectedId) ?? null;
-  const reachable = hosts.filter((h) => h.status !== 'down');
+  const reachable = hosts.filter((h) => h.status === 'healthy');
   const rtts = reachable
     .map((h) => h.rtt)
     .filter((value): value is number => value !== null);
@@ -229,63 +218,111 @@ export function NetworkDashboard() {
     rtts.length > 0
       ? [...rtts].sort((a, b) => a - b)[Math.floor(rtts.length / 2)]
       : null;
-  const averageLoss =
-    hosts.length > 0
-      ? hosts.reduce((total, h) => total + h.loss, 0) / hosts.length
-      : 0;
 
-  const runProbes = () => {
-    const now = new Date().toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    });
-
+  const runProbe = useCallback(async (target: Host) => {
+    if (
+      activeTargets.current.has(target.id) ||
+      removedTargets.current.has(target.id)
+    )
+      return;
+    activeTargets.current.add(target.id);
     setHosts((current) =>
-      current.map((host) => {
-        if (host.status === 'down') {
-          if (Math.random() < 0.4) {
-            return {
+      current.map((host) =>
+        host.id === target.id
+          ? {
               ...host,
-              status: 'degraded',
-              rtt: 84 + Math.round(Math.random() * 40),
-              jitter: 14.2,
-              loss: 22.4,
-            };
-          }
-
-          return { ...host, loss: 100 };
-        }
-
-        const base = host.rtt ?? 18;
-        const rtt = Math.max(
-          1,
-          Math.round((base + (Math.random() - 0.5) * 10) * 10) / 10,
-        );
-        const jitter = Math.max(
-          0.2,
-          Math.round((host.jitter + (Math.random() - 0.5) * 2) * 10) / 10,
-        );
-        const loss =
-          host.status === 'degraded'
-            ? Math.round((1 + Math.random() * 4) * 10) / 10
-            : Math.random() < 0.12
-              ? 0.4
-              : 0;
-
-        return {
-          ...host,
-          rtt,
-          jitter,
-          loss,
-          status: rtt > 60 || loss > 4 ? 'degraded' : 'healthy',
-        };
-      }),
+              status: 'checking',
+              message: 'Checking this target…',
+              rtt: null,
+            }
+          : host,
+      ),
     );
-    setLastProbeAt(now);
-  };
+
+    // The API and worker have their own limits. Bound browser requests too.
+    if (activeCount.current >= 5) {
+      await new Promise<void>((resolve) => waiting.current.push(resolve));
+    } else {
+      activeCount.current++;
+    }
+    try {
+      if (removedTargets.current.has(target.id)) return;
+      let result: ProbeResult;
+      try {
+        const response = await fetch('/api/probe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            host: target.host,
+            protocol: target.protocol,
+            port: target.port,
+          }),
+          signal: AbortSignal.timeout(10000),
+        });
+        const data: unknown = await response.json();
+        if (
+          !data ||
+          typeof data !== 'object' ||
+          typeof (data as ProbeResult).reachable !== 'boolean'
+        )
+          throw new Error('Invalid response');
+        result = data as ProbeResult;
+      } catch {
+        result = {
+          reachable: false,
+          rtt: null,
+          error: 'Could not contact the probe API or the request timed out.',
+        };
+      }
+      const outcome = describeProbe(target.protocol, result);
+      const now = new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+      setHosts((current) =>
+        current.map((host) =>
+          host.id === target.id
+            ? {
+                ...host,
+                status: outcome.status,
+                message: outcome.message,
+                rtt: outcome.status === 'healthy' ? result.rtt : null,
+                checkedAt: now,
+              }
+            : host,
+        ),
+      );
+      setLastProbeAt(now);
+    } finally {
+      activeTargets.current.delete(target.id);
+      const next = waiting.current.shift();
+      if (next) next();
+      else activeCount.current--;
+    }
+  }, []);
+
+  const runProbes = useCallback(async () => {
+    if (roundActive.current || hostsRef.current.length === 0) return;
+    roundActive.current = true;
+    setIsProbing(true);
+    try {
+      await Promise.all(hostsRef.current.map(runProbe));
+    } finally {
+      roundActive.current = false;
+      setIsProbing(false);
+    }
+  }, [runProbe]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void runProbes();
+    }, 30000);
+    return () => window.clearInterval(timer);
+  }, [runProbes]);
 
   const removeHost = (id: string) => {
+    removedTargets.current.add(id);
     const next = hosts.filter((host) => host.id !== id);
     setHosts(next);
     setAddedName(null);
@@ -304,13 +341,18 @@ export function NetworkDashboard() {
     if (!hostname) {
       setHostError('Enter a hostname or IP address.');
       invalid = true;
-    } else if (!/^[a-zA-Z0-9._:-]+$/.test(hostname)) {
+    } else if (!/^[a-zA-Z0-9.:-]+$/.test(hostname)) {
       setHostError('Use a hostname or IP address without spaces or slashes.');
       invalid = true;
     } else if (
-      hosts.some((host) => host.host.toLowerCase() === hostname.toLowerCase())
+      hosts.some(
+        (host) =>
+          host.host.toLowerCase() === hostname.toLowerCase() &&
+          host.protocol === protocol &&
+          host.port === (protocol === 'ICMP' ? null : Number(port)),
+      )
     ) {
-      setHostError('That host is already on the map.');
+      setHostError('That host and port are already on the map.');
       invalid = true;
     } else {
       setHostError(null);
@@ -338,21 +380,24 @@ export function NetworkDashboard() {
     }
 
     const newHost: Host = {
-      id: `${hostname.toLowerCase()}-${Date.now().toString(36)}`,
+      id: `${hostname.toLowerCase()}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
       host: hostname,
       protocol,
       port: protocol === 'ICMP' ? null : Number(port),
-      interval: Number(interval),
-      status: 'healthy',
-      rtt: 5 + Math.round(Math.random() * 30),
-      jitter: Math.round((0.4 + Math.random() * 3) * 10) / 10,
-      loss: 0,
+      interval: 0,
+      status: 'pending',
+      rtt: null,
+      jitter: 0,
+      loss: 100,
+      message: 'Waiting for the first check.',
+      checkedAt: null,
     };
 
     setHosts((current) => [...current, newHost]);
     setSelectedId(newHost.id);
     setHostInput('');
     setAddedName(hostname);
+    void runProbe(newHost);
   };
 
   return (
@@ -360,28 +405,22 @@ export function NetworkDashboard() {
       <CardHeader className="border-b">
         <CardTitle className="flex items-center gap-2 text-base">
           <Activity className="size-4 text-primary" />
-          Live topology
-          <span className="inline-flex items-center gap-1.5 rounded-full border border-success/25 bg-success/10 px-2 py-0.5 text-[10px] font-medium tracking-wide text-success uppercase">
-            <span className="relative flex size-1.5">
-              <span className="absolute inline-flex size-full animate-ping rounded-full bg-success opacity-70" />
-              <span className="relative inline-flex size-1.5 rounded-full bg-success" />
-            </span>
-            live
-          </span>
+          Network topology
+          <Badge variant="outline">Every 30s while open</Badge>
         </CardTitle>
         <CardDescription>
-          Click any node to inspect it. Filter by protocol, or run a probe round
-          to refresh every target.
+          Targets are checked when added and every 30 seconds while this page is
+          open. Click a node for its latest result.
         </CardDescription>
         <CardAction>
           <Button
             size="sm"
             variant="outline"
             onClick={runProbes}
-            disabled={hosts.length === 0}
+            disabled={hosts.length === 0 || isProbing}
           >
             <RefreshCw data-icon="inline-start" />
-            Run probes
+            {isProbing ? 'Checking connections…' : 'Run probes'}
           </Button>
         </CardAction>
       </CardHeader>
@@ -511,7 +550,7 @@ export function NetworkDashboard() {
                           }
                           className={cn(
                             meta.stroke,
-                            host.status !== 'down' &&
+                            host.status === 'healthy' &&
                               'animate-[flow-dash_2.6s_linear_infinite]',
                           )}
                         />
@@ -579,22 +618,18 @@ export function NetworkDashboard() {
                         className="cursor-pointer outline-none"
                       >
                         {isSelected && (
-                          <rect
-                            x={x - 80}
-                            y={y - 30}
-                            width={160}
-                            height={60}
-                            rx={14}
+                          <circle
+                            cx={x}
+                            cy={y}
+                            r={48}
                             className="fill-none stroke-primary/30"
                             strokeWidth={1.5}
                           />
                         )}
-                        <rect
-                          x={x - 76}
-                          y={y - 26}
-                          width={152}
-                          height={52}
-                          rx={11}
+                        <circle
+                          cx={x}
+                          cy={y}
+                          r={38}
                           strokeWidth={isSelected ? 1.8 : 1}
                           className={cn(
                             'fill-card',
@@ -602,21 +637,23 @@ export function NetworkDashboard() {
                           )}
                         />
                         <circle
-                          cx={x - 58}
-                          cy={y - 4}
-                          r={4}
+                          cx={x}
+                          cy={y - 13}
+                          r={6}
                           className={meta.fill}
                         />
                         <text
-                          x={x - 46}
-                          y={y - 1}
+                          x={x}
+                          y={y + 3}
+                          textAnchor="middle"
                           className="fill-foreground font-mono text-[12px]"
                         >
                           {shortHost(host.host)}
                         </text>
                         <text
-                          x={x - 46}
-                          y={y + 15}
+                          x={x}
+                          y={y + 26}
+                          textAnchor="middle"
                           className="fill-muted-foreground font-mono text-[10px]"
                         >
                           {host.protocol} · {formatRtt(host.rtt)}
@@ -635,7 +672,7 @@ export function NetworkDashboard() {
                     <div>
                       <p className="text-sm font-medium">Origin</p>
                       <p className="font-mono text-xs text-muted-foreground">
-                        192.168.1.10 · probing {hosts.length} targets
+                        Probe containers · {hosts.length} targets
                       </p>
                     </div>
                   </div>
@@ -665,7 +702,7 @@ export function NetworkDashboard() {
                           <ItemContent>
                             <ItemTitle>{host.host}</ItemTitle>
                             <ItemDescription className="font-mono text-xs">
-                              {targetLabel(host)}
+                              {targetLabel(host)} · {meta.label}
                             </ItemDescription>
                           </ItemContent>
                           <ItemActions>
@@ -725,7 +762,9 @@ export function NetworkDashboard() {
                     {statusMeta[status].label}
                   </span>
                 ))}
-                <span className="ml-auto font-mono">origin · 192.168.1.10</span>
+                <span className="ml-auto font-mono">
+                  origin · probe containers
+                </span>
               </div>
             </div>
 
@@ -737,7 +776,7 @@ export function NetworkDashboard() {
                       {selected.host}
                     </CardTitle>
                     <CardDescription className="font-mono text-xs">
-                      {targetLabel(selected)} · {selected.interval}s interval
+                      {targetLabel(selected)} · every 30s while open
                     </CardDescription>
                     <CardAction>
                       <Badge
@@ -763,14 +802,11 @@ export function NetworkDashboard() {
                         { label: 'RTT', value: formatRtt(selected.rtt) },
                         {
                           label: 'Jitter',
-                          value:
-                            selected.rtt === null
-                              ? '—'
-                              : `${selected.jitter.toFixed(1)} ms`,
+                          value: '—',
                         },
                         {
                           label: 'Loss',
-                          value: `${selected.loss.toFixed(1)}%`,
+                          value: '—',
                         },
                       ].map((stat) => (
                         <div
@@ -789,21 +825,25 @@ export function NetworkDashboard() {
 
                     <Separator />
 
-                    <p className="text-xs text-muted-foreground">
-                      {lastProbeAt
-                        ? `Last probe run at ${lastProbeAt}.`
-                        : 'Waiting for the first probe run.'}
+                    <p role="status" className="text-xs text-muted-foreground">
+                      {selected.message}
+                      {selected.checkedAt
+                        ? ` Last checked at ${selected.checkedAt}.`
+                        : ''}
                     </p>
 
                     <div className="flex items-center gap-2">
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={runProbes}
+                        onClick={() => void runProbe(selected)}
+                        disabled={selected.status === 'checking'}
                         className="flex-1"
                       >
                         <RefreshCw data-icon="inline-start" />
-                        Probe now
+                        {selected.status === 'checking'
+                          ? 'Checking…'
+                          : 'Probe now'}
                       </Button>
                       <Button
                         size="sm"
@@ -849,9 +889,7 @@ export function NetworkDashboard() {
                     </p>
                   </div>
                   <div>
-                    <p className="font-mono text-sm">
-                      {averageLoss.toFixed(1)}%
-                    </p>
+                    <p className="font-mono text-sm">—</p>
                     <p className="text-[10px] text-muted-foreground">
                       avg loss
                     </p>
@@ -868,7 +906,7 @@ export function NetworkDashboard() {
               <div className="mb-4">
                 <h3 className="text-sm font-medium">Add a target</h3>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  New hosts join the live map as soon as you add them.
+                  New hosts are checked immediately.
                 </p>
               </div>
 
@@ -912,6 +950,8 @@ export function NetworkDashboard() {
                         const next = value[0];
                         if (next) {
                           setProtocol(next as Protocol);
+                          if (next === 'UDP') setPort('53');
+                          if (next === 'TCP') setPort('443');
                           setPortError(null);
                         }
                       }}
@@ -926,6 +966,13 @@ export function NetworkDashboard() {
                         </ToggleGroupItem>
                       ))}
                     </ToggleGroup>
+                    <FieldDescription>
+                      {protocol === 'UDP'
+                        ? 'Checks DNS over UDP with an example.com A query; not a generic UDP port test.'
+                        : protocol === 'ICMP'
+                          ? 'Checks for an ICMP echo reply from the probe worker.'
+                          : 'Checks whether a TCP connection can be established.'}
+                    </FieldDescription>
                   </Field>
 
                   {protocol !== 'ICMP' && (
@@ -952,37 +999,16 @@ export function NetworkDashboard() {
                     </Field>
                   )}
 
-                  <Field>
-                    <FieldLabel htmlFor="target-interval">Interval</FieldLabel>
-                    <Select
-                      items={intervalItems}
-                      value={interval}
-                      onValueChange={(value) => {
-                        if (value) {
-                          setInterval(value);
-                        }
-                      }}
-                    >
-                      <SelectTrigger id="target-interval" className="w-full">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectGroup>
-                          {intervalItems.map((item) => (
-                            <SelectItem key={item.value} value={item.value}>
-                              {item.label}
-                            </SelectItem>
-                          ))}
-                        </SelectGroup>
-                      </SelectContent>
-                    </Select>
-                  </Field>
+                  <FieldDescription>
+                    Checks repeat every 30 seconds while this page remains open.
+                    Background server monitoring is not implemented yet.
+                  </FieldDescription>
                 </FieldGroup>
 
                 <Button
                   type="submit"
                   className="w-full"
-                  disabled={hosts.length >= 8}
+                  disabled={hosts.length >= 20}
                 >
                   <Plus data-icon="inline-start" />
                   Add target
@@ -990,13 +1016,13 @@ export function NetworkDashboard() {
 
                 {addedName ? (
                   <p role="status" className="text-xs text-success">
-                    Added {addedName} to the map.
+                    Added {addedName}; see its current status below.
                   </p>
                 ) : null}
 
-                {hosts.length >= 8 ? (
+                {hosts.length >= 20 ? (
                   <p className="text-xs text-muted-foreground">
-                    This interactive demo holds up to 8 targets. Remove one to
+                    This interactive demo holds up to 20 targets. Remove one to
                     add another.
                   </p>
                 ) : null}
@@ -1087,8 +1113,13 @@ export function NetworkDashboard() {
                             </Badge>
                           </ItemTitle>
                           <ItemDescription className="font-mono text-xs">
-                            {targetLabel(host)} · {host.interval}s ·{' '}
-                            {host.loss.toFixed(1)}% loss
+                            {targetLabel(host)} ·{' '}
+                            {host.checkedAt
+                              ? `checked ${host.checkedAt}`
+                              : 'not yet checked'}
+                          </ItemDescription>
+                          <ItemDescription role="status" className="text-xs">
+                            {host.message}
                           </ItemDescription>
                         </ItemContent>
                         <ItemActions>

@@ -13,9 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'Net Visualizer — Real-time connectivity dashboard',
-  description:
-    'See your network live. Pin an origin, add target hosts, and watch TCP, ICMP and UDP connectivity on an interactive real-time map.',
+  title: 'Net Visualizer — Connectivity dashboard',
+  description: 'Visualize on-demand TCP, ICMP and DNS over UDP checks.',
 };
 
 export default function RootLayout({ children }: LayoutProps<'/'>) {
