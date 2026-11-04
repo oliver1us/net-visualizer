@@ -7,13 +7,16 @@ services:
       - '3000:3000'
     environment:
       # Explicitly set the networks you own or are authorized to monitor.
-      PROBE_ALLOWED_CIDRS: ${PROBE_ALLOWED_CIDRS:-0.0.0.0/0}
+      PROBE_ALLOWED_CIDRS: ${PROBE_ALLOWED_CIDRS:-}
       PROBE_WORKER_SOCKET: /run/probe/worker.sock
+      PROBE_PASSWORD: ${PROBE_PASSWORD:-}
+      PROBE_DB_PATH: /app/data/monitor.sqlite
     depends_on:
       probe-worker:
         condition: service_healthy
     volumes:
       - probe-socket:/run/probe:ro
+      - probe-data:/app/data
     init: true
     read_only: true
     tmpfs:
@@ -49,7 +52,7 @@ services:
       context: .
       dockerfile: worker/Dockerfile
     environment:
-      PROBE_ALLOWED_CIDRS: ${PROBE_ALLOWED_CIDRS:-0.0.0.0/0}
+      PROBE_ALLOWED_CIDRS: ${PROBE_ALLOWED_CIDRS:-}
     volumes:
       - probe-socket:/run/probe
     init: true
@@ -80,3 +83,4 @@ services:
 
 volumes:
   probe-socket:
+  probe-data:

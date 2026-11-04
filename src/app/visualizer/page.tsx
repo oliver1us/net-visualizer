@@ -25,8 +25,8 @@ const signalCards = [
   {
     icon: RadioTower,
     label: 'Signal pulse',
-    value: '30 seconds',
-    detail: 'While this page is open',
+    value: 'Continuous',
+    detail: 'Server-side monitoring',
     tone: 'text-primary bg-primary/10 ring-primary/20',
   },
   {

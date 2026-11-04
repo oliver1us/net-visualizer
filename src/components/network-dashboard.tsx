@@ -50,12 +50,7 @@ import { Separator } from '@/components/ui/separator';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { cn } from '@/lib/utils';
-import {
-  describeProbe,
-  type ProbeResult,
-  type ProbeStatus,
-  type Protocol,
-} from '@/lib/probe-status';
+import { type ProbeStatus, type Protocol } from '@/lib/probe-status';
 
 type Status = ProbeStatus;
 type Filter = 'all' | Protocol;
@@ -68,8 +63,8 @@ type Host = {
   interval: number;
   status: Status;
   rtt: number | null;
-  jitter: number;
-  loss: number;
+  jitter: number | null;
+  loss: number | null;
   message: string;
   checkedAt: string | null;
 };
@@ -185,7 +180,6 @@ export function NetworkDashboard() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
   const [tab, setTab] = useState('topology');
-  const [lastProbeAt, setLastProbeAt] = useState<string | null>(null);
 
   const [hostInput, setHostInput] = useState('');
   const [protocol, setProtocol] = useState<Protocol>('TCP');
@@ -196,11 +190,8 @@ export function NetworkDashboard() {
   const [isProbing, setIsProbing] = useState(false);
   const hostInputRef = useRef<HTMLInputElement>(null);
   const hostsRef = useRef(hosts);
-  const activeTargets = useRef(new Set<string>());
-  const removedTargets = useRef(new Set<string>());
-  const activeCount = useRef(0);
-  const waiting = useRef<(() => void)[]>([]);
-  const roundActive = useRef(false);
+  const [interval, setIntervalValue] = useState(30);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     hostsRef.current = hosts;
@@ -218,120 +209,83 @@ export function NetworkDashboard() {
     rtts.length > 0
       ? [...rtts].sort((a, b) => a - b)[Math.floor(rtts.length / 2)]
       : null;
+  const measuredLoss = hosts
+    .map((host) => host.loss)
+    .filter((value): value is number => value !== null);
+  const averageLoss = measuredLoss.length
+    ? measuredLoss.reduce((sum, value) => sum + value, 0) / measuredLoss.length
+    : null;
 
-  const runProbe = useCallback(async (target: Host) => {
-    if (
-      activeTargets.current.has(target.id) ||
-      removedTargets.current.has(target.id)
-    )
-      return;
-    activeTargets.current.add(target.id);
-    setHosts((current) =>
-      current.map((host) =>
-        host.id === target.id
-          ? {
-              ...host,
-              status: 'checking',
-              message: 'Checking this target…',
-              rtt: null,
-            }
-          : host,
-      ),
-    );
-
-    // The API and worker have their own limits. Bound browser requests too.
-    if (activeCount.current >= 5) {
-      await new Promise<void>((resolve) => waiting.current.push(resolve));
-    } else {
-      activeCount.current++;
-    }
+  const refresh = useCallback(async () => {
     try {
-      if (removedTargets.current.has(target.id)) return;
-      let result: ProbeResult;
-      try {
-        const response = await fetch('/api/probe', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            host: target.host,
-            protocol: target.protocol,
-            port: target.port,
-          }),
-          signal: AbortSignal.timeout(10000),
-        });
-        const data: unknown = await response.json();
-        if (
-          !data ||
-          typeof data !== 'object' ||
-          typeof (data as ProbeResult).reachable !== 'boolean'
-        )
-          throw new Error('Invalid response');
-        result = data as ProbeResult;
-      } catch {
-        result = {
-          reachable: false,
-          rtt: null,
-          error: 'Could not contact the probe API or the request timed out.',
-        };
-      }
-      const outcome = describeProbe(target.protocol, result);
-      const now = new Date().toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-      });
-      setHosts((current) =>
-        current.map((host) =>
-          host.id === target.id
-            ? {
-                ...host,
-                status: outcome.status,
-                message: outcome.message,
-                rtt: outcome.status === 'healthy' ? result.rtt : null,
-                checkedAt: now,
-              }
-            : host,
-        ),
+      const response = await fetch('/api/targets', { cache: 'no-store' });
+      if (!response.ok) throw new Error('Unable to load monitored targets.');
+      const data = (await response.json()) as { targets: Host[] };
+      setHosts(data.targets);
+      setLoadError(null);
+    } catch {
+      setLoadError(
+        'Cannot reach the monitoring API. Check authentication and server health.',
       );
-      setLastProbeAt(now);
-    } finally {
-      activeTargets.current.delete(target.id);
-      const next = waiting.current.shift();
-      if (next) next();
-      else activeCount.current--;
     }
   }, []);
 
+  const runProbe = useCallback(
+    async (target: Host) => {
+      try {
+        const response = await fetch(
+          `/api/targets/${encodeURIComponent(target.id)}`,
+          { method: 'POST' },
+        );
+        if (!response.ok) throw new Error();
+        await refresh();
+      } catch {
+        setLoadError('Unable to request a probe.');
+      }
+    },
+    [refresh],
+  );
+
   const runProbes = useCallback(async () => {
-    if (roundActive.current || hostsRef.current.length === 0) return;
-    roundActive.current = true;
+    if (hostsRef.current.length === 0) return;
     setIsProbing(true);
     try {
       await Promise.all(hostsRef.current.map(runProbe));
     } finally {
-      roundActive.current = false;
       setIsProbing(false);
     }
   }, [runProbe]);
 
   useEffect(() => {
+    const initial = window.setTimeout(() => {
+      void refresh();
+    }, 0);
     const timer = window.setInterval(() => {
-      void runProbes();
-    }, 30000);
-    return () => window.clearInterval(timer);
-  }, [runProbes]);
+      void refresh();
+    }, 3000);
+    return () => {
+      window.clearTimeout(initial);
+      window.clearInterval(timer);
+    };
+  }, [refresh]);
 
-  const removeHost = (id: string) => {
-    removedTargets.current.add(id);
-    const next = hosts.filter((host) => host.id !== id);
-    setHosts(next);
+  const removeHost = async (id: string) => {
+    const response = await fetch(`/api/targets/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) {
+      setLoadError('Unable to remove target.');
+      return;
+    }
+    const next = hostsRef.current.filter((host) => host.id !== id);
+    await refresh();
     setAddedName(null);
     if (selectedId === id) {
       setSelectedId(next[0]?.id ?? null);
     }
   };
 
-  const addHost = (event: React.FormEvent<HTMLFormElement>) => {
+  const addHost = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setAddedName(null);
 
@@ -379,25 +333,25 @@ export function NetworkDashboard() {
       return;
     }
 
-    const newHost: Host = {
-      id: `${hostname.toLowerCase()}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
-      host: hostname,
-      protocol,
-      port: protocol === 'ICMP' ? null : Number(port),
-      interval: 0,
-      status: 'pending',
-      rtt: null,
-      jitter: 0,
-      loss: 100,
-      message: 'Waiting for the first check.',
-      checkedAt: null,
-    };
-
-    setHosts((current) => [...current, newHost]);
-    setSelectedId(newHost.id);
+    const response = await fetch('/api/targets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        host: hostname,
+        protocol,
+        port: protocol === 'ICMP' ? null : Number(port),
+        interval,
+      }),
+    });
+    const data = (await response.json()) as { id?: string; error?: string };
+    if (!response.ok || !data.id) {
+      setHostError(data.error ?? 'Unable to save target.');
+      return;
+    }
+    setSelectedId(data.id);
+    await refresh();
     setHostInput('');
     setAddedName(hostname);
-    void runProbe(newHost);
   };
 
   return (
@@ -406,11 +360,11 @@ export function NetworkDashboard() {
         <CardTitle className="flex items-center gap-2 text-base">
           <Activity className="size-4 text-primary" />
           Network topology
-          <Badge variant="outline">Every 30s while open</Badge>
+          <Badge variant="outline">Server monitoring</Badge>
         </CardTitle>
         <CardDescription>
-          Targets are checked when added and every 30 seconds while this page is
-          open. Click a node for its latest result.
+          Targets are checked when added and continuously by the server. Click a
+          node for its latest result.
         </CardDescription>
         <CardAction>
           <Button
@@ -425,8 +379,8 @@ export function NetworkDashboard() {
         </CardAction>
       </CardHeader>
 
-      <p className="sr-only" aria-live="polite">
-        {lastProbeAt ? `Probe round completed at ${lastProbeAt}.` : ''}
+      <p role="status" className="px-4 text-xs text-destructive">
+        {loadError}
       </p>
 
       <Tabs value={tab} onValueChange={setTab} className="gap-0">
@@ -776,7 +730,7 @@ export function NetworkDashboard() {
                       {selected.host}
                     </CardTitle>
                     <CardDescription className="font-mono text-xs">
-                      {targetLabel(selected)} · every 30s while open
+                      {targetLabel(selected)} · every {selected.interval}s
                     </CardDescription>
                     <CardAction>
                       <Badge
@@ -802,11 +756,17 @@ export function NetworkDashboard() {
                         { label: 'RTT', value: formatRtt(selected.rtt) },
                         {
                           label: 'Jitter',
-                          value: '—',
+                          value:
+                            selected.jitter === null
+                              ? '—'
+                              : `${selected.jitter.toFixed(1)} ms`,
                         },
                         {
                           label: 'Loss',
-                          value: '—',
+                          value:
+                            selected.loss === null
+                              ? '—'
+                              : `${selected.loss.toFixed(1)}%`,
                         },
                       ].map((stat) => (
                         <div
@@ -828,7 +788,7 @@ export function NetworkDashboard() {
                     <p role="status" className="text-xs text-muted-foreground">
                       {selected.message}
                       {selected.checkedAt
-                        ? ` Last checked at ${selected.checkedAt}.`
+                        ? ` Last checked at ${new Date(selected.checkedAt).toLocaleTimeString()}.`
                         : ''}
                     </p>
 
@@ -889,7 +849,11 @@ export function NetworkDashboard() {
                     </p>
                   </div>
                   <div>
-                    <p className="font-mono text-sm">—</p>
+                    <p className="font-mono text-sm">
+                      {averageLoss === null
+                        ? '—'
+                        : `${averageLoss.toFixed(1)}%`}
+                    </p>
                     <p className="text-[10px] text-muted-foreground">
                       avg loss
                     </p>
@@ -906,7 +870,7 @@ export function NetworkDashboard() {
               <div className="mb-4">
                 <h3 className="text-sm font-medium">Add a target</h3>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  New hosts are checked immediately.
+                  New hosts are saved and checked immediately by the server.
                 </p>
               </div>
 
@@ -999,10 +963,25 @@ export function NetworkDashboard() {
                     </Field>
                   )}
 
-                  <FieldDescription>
-                    Checks repeat every 30 seconds while this page remains open.
-                    Background server monitoring is not implemented yet.
-                  </FieldDescription>
+                  <Field>
+                    <FieldTitle>Interval</FieldTitle>
+                    <ToggleGroup
+                      variant="outline"
+                      value={[String(interval)]}
+                      onValueChange={(value) => {
+                        if (value[0]) setIntervalValue(Number(value[0]));
+                      }}
+                    >
+                      {[10, 30, 60].map((seconds) => (
+                        <ToggleGroupItem key={seconds} value={String(seconds)}>
+                          {seconds}s
+                        </ToggleGroupItem>
+                      ))}
+                    </ToggleGroup>
+                    <FieldDescription>
+                      Checks continue even when this page is closed.
+                    </FieldDescription>
+                  </Field>
                 </FieldGroup>
 
                 <Button
@@ -1113,9 +1092,9 @@ export function NetworkDashboard() {
                             </Badge>
                           </ItemTitle>
                           <ItemDescription className="font-mono text-xs">
-                            {targetLabel(host)} ·{' '}
+                            {targetLabel(host)} · every {host.interval}s ·{' '}
                             {host.checkedAt
-                              ? `checked ${host.checkedAt}`
+                              ? `checked ${new Date(host.checkedAt).toLocaleTimeString()}`
                               : 'not yet checked'}
                           </ItemDescription>
                           <ItemDescription role="status" className="text-xs">

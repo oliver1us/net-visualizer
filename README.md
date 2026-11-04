@@ -1,10 +1,9 @@
 # Net Visualizer
 
-Net Visualizer checks TCP, ICMP echo and DNS over UDP targets when added and
-every 30 seconds while the dashboard page remains open. Browsers may delay
-checks in background tabs. This is not yet server-side continuous monitoring:
-targets disappear on reload, and persistent history and Prometheus integration
-are not implemented.
+Net Visualizer continuously checks saved TCP, ICMP echo and DNS over UDP targets
+from the server. Targets survive browser reloads and container restarts through
+the `probe-data` Docker volume. The dashboard reads the latest results every
+three seconds. Prometheus integration and server-sent events are not implemented.
 
 ## Docker Compose
 
@@ -15,13 +14,19 @@ explicitly to the same narrow policy for both services before broader use.
 Exposing probes to untrusted users is unsafe.
 
 ```sh
-PROBE_ALLOWED_CIDRS=192.168.1.0/24 docker compose up -d --build
+PROBE_ALLOWED_CIDRS=192.168.1.0/24 PROBE_PASSWORD='choose-a-long-random-secret' docker compose up -d --build
 ```
 
-Open <http://127.0.0.1:3000/visualizer>. The current `compose.yml` publishes
-port 3000 on **all host interfaces**. It has no authentication; change the port
-mapping to `127.0.0.1:3000:3000` for local-only access, or restrict access
-externally before starting it. Separate multiple IPv4 or IPv6
+Open <http://127.0.0.1:3000/visualizer> and enter username `admin` and the
+configured password when prompted. A missing or shorter than 16-character
+`PROBE_PASSWORD` prevents access (except `/api/health`). Set a long random value
+in a private `.env` or Docker secret management; avoid typing it into a shared
+shell history. The current `compose.yml` publishes port 3000 on **all host
+interfaces**. HTTP Basic authentication sends credentials in reversible form:
+**do not use it over unencrypted HTTP across a network**. Change the mapping
+to `127.0.0.1:3000:3000` for local-only access, or place an authenticating TLS
+reverse proxy in front and firewall the direct port before remote access.
+Separate multiple IPv4 or IPv6
 addresses/CIDRs with commas, e.g. `192.168.1.0/24,2001:db8:1::/64`.
 An address without a prefix means one address. Set the variable each time you
 run `docker compose up`, or put it in a local `.env` file. Changing the value
@@ -48,7 +53,9 @@ targets are healthy. The image uses three stages, a digest-pinned Node 24 base,
 and Next.js standalone output. The container uses an unprivileged user, a
 read-only root filesystem, limited writable tmpfs mounts, dropped capabilities,
 `no-new-privileges`, resource limits and bounded logs. Update the pinned base
-digest and rebuild regularly to receive security fixes.
+digest and rebuild regularly to receive security fixes. `docker compose down`
+preserves targets; `docker compose down --volumes` deletes monitoring data.
+Back up the `probe-data` volume before upgrades if you need to retain history.
 
 The worker has no published TCP port. The web app connects to its Unix socket
 through a dedicated volume mounted read-only by the web container; both services
@@ -65,10 +72,11 @@ unknown, not as proof that a host or arbitrary UDP port is down.
 
 ### Security limits
 
-The UI is intended only for a trusted local user. The current port mapping
-exposes it on all interfaces; restrict it before use.
-**There is no authentication, authorization, port allowlist, per-client rate
-limit, or audit log.** Any local user able to access it can probe any port in
+The UI is intended for a single trusted administrator. The current port mapping
+exposes it on all interfaces; restrict it before use. HTTP Basic protects the
+panel and APIs but requires TLS for remote access. **There is no per-user
+authorization, port allowlist, per-client rate limit, or audit log.** Any
+authenticated user can save up to 20 targets and probe any port in
 the allowed networks, including sensitive addresses if explicitly allowed.
 Do not expose it to untrusted users or to the internet. Remote or multiuser use
 requires authentication, TLS, network egress controls, request/body timeouts,
@@ -90,8 +98,8 @@ npm run test:integration
 The integration tests expect a policy that denies loopback and the metadata
 address, so they are not compatible with the temporary all-IPv4 default. To test a
 successful and a refused TCP connection, temporarily start a **test instance**
-with `PROBE_ALLOWED_CIDRS=127.0.0.1/32` and run
-`TEST_ALLOW_LOOPBACK=1 npm run test:integration`. The test connects to the
+with `PROBE_ALLOWED_CIDRS=127.0.0.1/32` and `PROBE_PASSWORD` set, then run
+`TEST_PASSWORD='same-password' TEST_ALLOW_LOOPBACK=1 npm run test:integration`. The test connects to the
 application's own port inside the web container and checks ICMP echo inside the
 worker container. Do not add loopback to a
 production allowlist just to run this test. `TEST_BASE_URL` can change the
@@ -107,9 +115,11 @@ container for the loopback success test.
 2. **Partially complete:** isolated probe worker, ICMP echo and validated
    UDP/DNS probes. Authentication and authorization, port and rate policies
    remain pending.
-3. **Partially complete:** immediate, per-target status and periodic checks while
-   the browser page is open. Server-side scheduling, persistent targets and
-   sample history, rolling loss/latency metrics, and live updates remain pending.
+3. **Partially complete:** server-side scheduling (10/30/60 seconds), persisted
+   targets and the latest 20 samples per target, and dashboard polling. Loss is
+   computed from successful/down samples (excluding policy, DNS and worker
+   errors). Jitter shows the difference between the two latest successful
+   samples. SSE and richer historical charts remain pending.
 4. **Pending:** full protocol/security end-to-end tests, monitoring and optional
    Prometheus integration.
 

@@ -4,11 +4,16 @@ import { test } from 'node:test';
 
 const base = process.env.TEST_BASE_URL ?? 'http://127.0.0.1:3000';
 const allowLoopback = process.env.TEST_ALLOW_LOOPBACK === '1';
+const authorization = process.env.TEST_PASSWORD
+  ? {
+      authorization: `Basic ${Buffer.from(`admin:${process.env.TEST_PASSWORD}`).toString('base64')}`,
+    }
+  : {};
 
 async function probe(body, extra = {}) {
   const response = await fetch(`${base}/api/probe`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...extra },
+    headers: { 'content-type': 'application/json', ...authorization, ...extra },
     body: JSON.stringify(body),
   });
   return { status: response.status, body: await response.json() };
@@ -19,6 +24,60 @@ test('health endpoint responds without probing a target', async () => {
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { status: 'ok' });
 });
+
+test(
+  'protected monitoring endpoints reject unauthenticated requests',
+  { skip: !process.env.TEST_PASSWORD },
+  async () => {
+    const response = await fetch(`${base}/api/targets`);
+    assert.equal(response.status, 401);
+    assert.equal(
+      response.headers.get('www-authenticate')?.includes('Basic'),
+      true,
+    );
+  },
+);
+
+test(
+  'saved target is checked by the server and can be removed',
+  { skip: !allowLoopback || !process.env.TEST_PASSWORD },
+  async () => {
+    const headers = { 'content-type': 'application/json', ...authorization };
+    const created = await fetch(`${base}/api/targets`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        host: '127.0.0.1',
+        protocol: 'ICMP',
+        port: null,
+        interval: 10,
+      }),
+    });
+    assert.equal(created.status, 201);
+    const { id } = await created.json();
+    try {
+      let entry;
+      for (let i = 0; i < 20; i++) {
+        const list = await (
+          await fetch(`${base}/api/targets`, { headers: authorization })
+        ).json();
+        entry = list.targets.find((t) => t.id === id);
+        if (entry?.checkedAt) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.equal(entry.status, 'healthy');
+      assert.equal(entry.interval, 10);
+      assert.equal(entry.loss, 0);
+      assert.equal(typeof entry.checkedAt, 'string');
+    } finally {
+      const removed = await fetch(`${base}/api/targets/${id}`, {
+        method: 'DELETE',
+        headers: authorization,
+      });
+      assert.equal(removed.status, 204);
+    }
+  },
+);
 
 test('rejects unsupported protocols, invalid requests and cross-origin requests', async () => {
   const unsupported = await probe({
@@ -47,13 +106,13 @@ test('rejects unsupported protocols, invalid requests and cross-origin requests'
   );
   const invalid = await fetch(`${base}/api/probe`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...authorization },
     body: 'null',
   });
   assert.equal(invalid.status, 400);
   const large = await fetch(`${base}/api/probe`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...authorization },
     body: JSON.stringify({ host: 'x'.repeat(3000) }),
   });
   assert.equal(large.status, 413);

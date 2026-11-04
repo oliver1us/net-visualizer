@@ -16,7 +16,7 @@ RUN npm run build
 FROM ${NODE_IMAGE} AS runtime
 WORKDIR /app
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
-RUN mkdir -p /run/probe && chown node:node /run/probe
+RUN mkdir -p /run/probe /app/data && chown node:node /run/probe /app/data
 COPY --from=build --chown=node:node /app/.next/standalone ./
 COPY --from=build --chown=node:node /app/.next/static ./.next/static
 COPY --from=build --chown=node:node /app/public ./public
